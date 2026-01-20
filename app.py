@@ -7,6 +7,148 @@ import plotly.graph_objects as go
 from graphviz import Digraph
 from sklearn.metrics import r2_score, mean_squared_error
 
+# =============================
+# PAGE CONFIG
+# =============================
+st.set_page_config(
+    page_title="Battery Black Mass Leaching — Digital Twin",
+    page_icon="🧪",
+    layout="wide",
+)
+
+# Global CSS (clean industrial dark theme)
+st.markdown("""
+<style>
+:root {
+    --bg-main: #050814;
+    --bg-elevated: #0B1020;
+    --border-subtle: rgba(255,255,255,0.06);
+    --accent: #3B82F6;
+    --accent-soft: rgba(59,130,246,0.15);
+    --text-main: #F9FAFB;
+    --text-subtle: #9CA3AF;
+    --danger: #DC2626;
+    --success: #16A34A;
+    --warning: #F59E0B;
+    --radius-card: 12px;
+}
+
+/* App background */
+[data-testid="stAppViewContainer"] {
+    background: radial-gradient(circle at 0 0, #020617 0%, #020617 40%, #020617 100%);
+    color: var(--text-main);
+}
+
+/* Hide Streamlit chrome */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+
+/* Cards */
+.card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-card);
+    padding: 14px 16px;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.55);
+    margin-bottom: 14px;
+}
+
+.card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+
+.card-title {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+}
+
+.card-subtitle {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-subtle);
+}
+
+/* Headline */
+.app-header {
+    background: linear-gradient(90deg, rgba(37,99,235,0.16), transparent);
+    border-radius: var(--radius-card);
+    padding: 16px 18px 14px 18px;
+    border: 1px solid rgba(59,130,246,0.25);
+    margin-bottom: 16px;
+}
+.app-header h1 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 650;
+}
+.app-header p {
+    margin: 4px 0 0 0;
+    font-size: 13px;
+    color: var(--text-subtle);
+}
+
+/* Buttons */
+div.stButton > button {
+    border-radius: 999px;
+    padding: 6px 0;
+    font-weight: 600;
+    border: 1px solid transparent;
+    background: #111827;
+}
+div.stButton > button:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+/* Primary / danger button overrides by label */
+div.stButton > button[kind="primary"] {
+    background: var(--accent);
+    color: white;
+}
+div.stButton > button[kind="primary"]:hover {
+    background: #2563EB;
+}
+div.stButton > button.danger {
+    background: rgba(220,38,38,0.1) !important;
+    color: #FCA5A5 !important;
+    border-color: rgba(220,38,38,0.4) !important;
+}
+
+/* Metric cards */
+[data-testid="stMetricValue"] {
+    font-size: 20px !important;
+    font-weight: 700 !important;
+}
+[data-testid="stMetricDelta"] {
+    font-size: 11px !important;
+}
+
+/* Radio / select clean look */
+.stRadio > label, .stSelectbox > label, .stSlider > label, .stNumberInput > label, .stTextInput > label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-subtle);
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =============================
+# GLOBAL TITLE
+# =============================
+st.markdown("""
+<div class="app-header">
+  <h1>Battery Black Mass Leaching — Digital Twin</h1>
+  <p>ML-assisted process monitoring, virtual commissioning, and anomaly detection for batch leaching.</p>
+</div>
+""", unsafe_allow_html=True)
+
+
 
 @st.cache_data
 def compute_model_metrics(_model, FEATURES):
