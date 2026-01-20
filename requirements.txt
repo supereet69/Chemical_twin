@@ -6,3 +6,4 @@ scikit-learn
 plotly
 graphviz
 pyserial
+xgboost
