@@ -33,6 +33,25 @@ def compute_model_metrics(_model, FEATURES):
         metrics[tgt] = {"rmse": rmse, "r2": r2}
 
     return metrics
+@st.cache_data(show_spinner=False)
+def run_optimizer_cached(acid_range, h2o2_range, temp0, sim_time):
+    results = []
+    for a in acid_range:
+        for h in h2o2_range:
+            out = optimizer.evaluate(
+                acid_M=float(a),
+                h2o2_ml=float(h),
+                temp_C=float(temp0),
+                time_s=float(sim_time)
+            )
+            if out.get("fault", "normal") == "normal":
+                results.append({
+                    "acid_M": a,
+                    "h2o2_ml": h,
+                    "recovery": out["recovery"]
+                })
+    return pd.DataFrame(results)
+
 
 
 # Optional: Arduino serial
@@ -66,6 +85,16 @@ FEATURES = bundle["features"]
 
 model_metrics = compute_model_metrics(model, FEATURES)
 
+# =============================
+# ADD: PROCESS OPTIMIZATION (BATCH-LEVEL)
+# =============================
+try:
+    from models.optimizer_backend import Optimizer
+    optimizer = Optimizer()
+except Exception:
+    optimizer = None
+
+
 
 
 # =============================
@@ -92,6 +121,36 @@ def compute_rate(df, col, time_col="time_s", window=3):
     out_col = f"d{col}_dt"
     out[out_col] = rate
     return out.dropna().reset_index(drop=True)
+
+def apply_sensor_drift(tds_true, drift_bias, severity, dt):
+    """
+    Instrumentation fault: does NOT change chemistry.
+    Bias accumulates slowly over time.
+    """
+    drift_rate = 0.8 * severity  # ppm/s
+    drift_bias += drift_rate * dt
+    tds_measured = tds_true + drift_bias
+    return tds_measured, drift_bias
+
+
+# =============================
+# ADD: REALTIME ANOMALY DETECTION (NON-ML, SAFE)
+# =============================
+def detect_realtime_anomaly(df, rate_thr=20.0, temp_thr=4.0):
+    """
+    Lightweight physics-based anomaly detector.
+    Uses recent |dTDS/dt| and |dT/dt|.
+    Returns (is_anomaly, score)
+    """
+    if df is None or len(df) < 6:
+        return False, 0.0
+
+    dtds = df["tds"].diff().abs().tail(3).mean()
+    dtemp = df["temp_C"].diff().abs().tail(3).mean()
+
+    score = 0.6 * (dtds / rate_thr) + 0.4 * (dtemp / temp_thr)
+    return score > 1.0, float(score)
+
 
 
 def compute_recovery_index(df):
@@ -219,22 +278,56 @@ def turbidity_sensor_update(turb_curr, turb_rate_ml, dt, noise_scale=0.8):
     return float(beta * turb_curr + (1 - beta) * turb_next)
 
 
-def apply_anomaly_to_rates(tds_rate, turb_rate, mode="Sensor Spike", severity=1.0):
+def apply_anomaly_to_rates(tds_rate, turb_rate, mode, severity):
     s = float(severity)
-    if mode == "Sensor Spike":
-        return tds_rate * (1.0 + 0.6 * s), turb_rate * (1.0 + 0.4 * s)
+
     if mode == "Acid Underfeed":
-        return tds_rate * (1.0 - 0.35 * s), turb_rate * (1.0 - 0.25 * s)
+        phi = max(0.2, 1.0 - 0.6 * s)   # H+ limitation
+        return tds_rate * phi, turb_rate * (1.0 - 0.4 * s)
+
     if mode == "Over-oxidation (H2O2)":
-        return tds_rate * (1.0 + 0.25 * s), turb_rate * (1.0 + 0.20 * s)
+        psi = 1.0 + 0.5 * s           # faster oxidation
+        return tds_rate * psi, turb_rate * (1.0 + 0.25 * s)
+
+    # Sensor drift handled elsewhere
     return tds_rate, turb_rate
+def apply_h2o2_recovery_penalty(tds, severity):
+    """
+    Over-oxidation causes secondary precipitation / passivation.
+    """
+    eta = max(0.6, 1.0 - 0.3 * severity)
+    return tds * eta
+
+
+# =============================
+# ADD: STATE-LEVEL ANOMALY RESPONSE (VIRTUAL COMMISSIONING ONLY)
+# =============================
+def apply_anomaly_to_state(state, r_tds, r_turb, anomaly_type, severity, dt):
+    """
+    Applies anomaly physics directly to the state evolution.
+    Used ONLY in Virtual Commissioning.
+    """
+    s = float(severity)
+    out = state.copy()
+
+    if anomaly_type == "Sensor Spike":
+        out["tds"] += 0.25 * out["tds"] * s
+
+    elif anomaly_type == "Acid Underfeed":
+        out["tds"] += ALPHA_INTEGRATION * r_tds * dt * (1.0 - 0.6 * s)
+
+    elif anomaly_type == "Over-oxidation (H2O2)":
+        out["tds"] += ALPHA_INTEGRATION * r_tds * dt * (1.0 + 0.8 * s)
+        out["temp_C"] += 4.0 * s
+
+    return out
+
 
 
 def predict_rates(model, FEATURES, row_dict):
     X = np.array([[row_dict.get(c, 0.0) for c in FEATURES]], dtype=float)
     pred = model.predict(X)[0]
     return float(pred[0]), float(pred[1])
-
 def predict_anomaly(row_dict):
     # plug-in later
     return False, 0.0
@@ -400,7 +493,6 @@ def try_connect_serial(port, baud):
         st.session_state.events.append(f"Arduino connect failed: {e}")
         return False
 
-
 # =============================
 # STREAMLIT UI
 # =============================
@@ -481,25 +573,6 @@ with top_container:
             st.caption("In Online Monitoring mode, values are fixed and measurements come from field instrumentation via Arduino.")
 
 st.divider()
-
-with st.expander("Digital Twin Governing Equations"):
-    st.markdown(r"""
-        ### Governing Reaction
-
-        \[
-        \mathrm{MO_2 + 4H^+ + e^- \rightarrow M^{2+} + 2H_2O}
-        \]
-
-        ### Kinetic Assumptions
-        - Surface-controlled oxidative leaching
-        - Pseudo-first-order behavior in early batch stage
-        - Oxidant-assisted electron transfer
-        - Apparent kinetics inferred from TDS evolution
-
-        This reaction framework is consistent with transition metal oxide dissolution
-        under acidic–oxidative conditions (LIB black mass leaching).
-        """)
-
 
 
 # =============================
@@ -684,32 +757,45 @@ with mid_container:
                     plotly_line(base_plot, "temp_C", "Temperature vs Time", "°C", anom_plot, df_fore),
                     use_container_width=True, config={"displayModeBar": False}
                 )
-                rate_df = compute_rate(base_plot, "tds")
+                rate_base = compute_rate(base_plot, "tds")
 
-                if rate_df is not None:
+                rate_anom = (
+                    compute_rate(anom_plot, "tds")
+                    if anom_plot is not None
+                    else None
+                )
+                if rate_base is not None:
                     g4.plotly_chart(
                         plotly_line(
-                            rate_df,
-                            "dtds_dt",  
+                            rate_base,
+                            "dtds_dt",
                             "TDS Dissolution Rate vs Time",
-                            "d(TDS)/dt (ppm/s)"
+                            "d(TDS)/dt (ppm/s)",
+                            df_anom=rate_anom
                         ),
                         use_container_width=True,
                         config={"displayModeBar": False}
                     )
-                rec_df = compute_recovery_index(base_plot)
 
-                if rec_df is not None:
+                rec_base = compute_recovery_index(base_plot)
+                rec_anom = (
+                    compute_recovery_index(anom_plot)
+                    if anom_plot is not None
+                    else None
+                )
+                if rec_base is not None:
                     g5.plotly_chart(
                         plotly_line(
-                            rec_df,
+                            rec_base,
                             "recovery_index",
                             "Relative Metal Recovery Index",
-                            "Fractional Recovery (–)"
+                            "Fractional Recovery (–)",
+                            df_anom=rec_anom
                         ),
                         use_container_width=True,
                         config={"displayModeBar": False}
                     )
+
 
 
 
@@ -817,64 +903,108 @@ if st.session_state.running and mode == "Virtual Commissioning":
     # ✅ ENSURE INITIAL STATE EXISTS
     last = st.session_state.hist_base.iloc[-1].to_dict()
 
-
     if anomaly_on and len(st.session_state.hist_anom) == 0:
         st.session_state.hist_anom = st.session_state.hist_base.tail(1).copy()
 
-    while st.session_state.running:
+    # ==================================================
+# SIMULATION RUN (Virtual Commissioning — BATCH)
+# ==================================================
+    if st.session_state.running and mode == "Virtual Commissioning":
+        states_base = []
+        states_anom = []
 
-        base = st.session_state.hist_base.copy()
-        last = base.iloc[-1].to_dict()
+        # ---- INITIAL STATES ----
+        curr_base = {
+            "time_s": 0.0,
+            "acid_M": float(acid_M),
+            "h2o2_ml": float(h2o2_ml),
+            "tds": float(tds0),
+            "turbidity": float(turb0),
+            "temp_C": float(temp0),
+        }
 
-        r_tds, r_turb = predict_rates(model, FEATURES, last)
-        r_tds = np.clip(r_tds, -50.0, 50.0)
-        r_turb = np.clip(r_turb, -30.0, 30.0)
+        curr_anom = curr_base.copy()
+
+        states_base.append(curr_base.copy())
+        states_anom.append(curr_anom.copy())
+    # initialize drift bias ONCE (before loop)
+        drift_bias = 0.0
+
+        # ---- BATCH SIMULATION ----
+        while curr_base["time_s"] < sim_time:
+
+            # ===== BASE =====
+            r_tds, r_turb = predict_rates(model, FEATURES, curr_base)
+            r_tds = np.clip(r_tds, -50.0, 50.0)
+            r_turb = np.clip(r_turb, -30.0, 30.0)
+
+            nxt_base = curr_base.copy()
+            nxt_base["time_s"] += DT
+            nxt_base["temp_C"] = temp_dynamics(curr_base["temp_C"], h2o2_ml, DT)
+            nxt_base["tds"] = max(
+                0.0, curr_base["tds"] + ALPHA_INTEGRATION * r_tds * DT
+            )
+            nxt_base["turbidity"] = turbidity_sensor_update(
+                curr_base["turbidity"], r_turb, DT, noise_scale=0.6
+            )
+
+            # ===== ANOMALY =====
+            nxt_anom = nxt_base.copy()
+
+            # ===== ANOMALY =====
+            nxt_anom = nxt_base.copy()
+            r_tds_a, r_turb_a = r_tds, r_turb
+
+            if anomaly_on and curr_base["time_s"] >= anomaly_time:
+
+                # --- CHEMICAL FAULTS ---
+                if anomaly_type in ["Acid Underfeed", "Over-oxidation (H2O2)"]:
+                    r_tds_a, r_turb_a = apply_anomaly_to_rates(
+                        r_tds, r_turb, anomaly_type, anomaly_severity
+                    )
+
+                # integrate kinetics
+                nxt_anom["tds"] = max(
+                    0.0, curr_anom["tds"] + ALPHA_INTEGRATION * r_tds_a * DT
+                )
+
+                # H2O2 recovery loss (post-kinetics)
+                if anomaly_type == "Over-oxidation (H2O2)":
+                    nxt_anom["tds"] = apply_h2o2_recovery_penalty(
+                        nxt_anom["tds"], anomaly_severity
+                    )
+
+                # SENSOR DRIFT (measurement-only)
+                if anomaly_type == "Sensor Spike":
+                    nxt_anom["tds"], drift_bias = apply_sensor_drift(
+                        nxt_anom["tds"], drift_bias, anomaly_severity, DT
+                    )
+
+                nxt_anom["turbidity"] = turbidity_sensor_update(
+                    curr_anom["turbidity"], r_turb_a, DT, noise_scale=1.2
+                )
+
+            
+
+            states_base.append(nxt_base)
+            states_anom.append(nxt_anom)
+
+            curr_base = nxt_base
+            curr_anom = nxt_anom
 
 
-        nxt = last.copy()
-        nxt["time_s"] += DT
-        nxt["temp_C"] = temp_dynamics(last["temp_C"], h2o2_ml, DT)
-        nxt["tds"] = max(0.0, float(nxt["tds"] + ALPHA_INTEGRATION * r_tds * DT))
-        nxt["turbidity"] = turbidity_sensor_update(last["turbidity"], r_turb, DT, noise_scale=0.6)
-
-        st.session_state.hist_base = pd.concat(
-            [st.session_state.hist_base, pd.DataFrame([nxt])],
-            ignore_index=True
-        )
-        st.session_state.hist_base = keep_last_n(st.session_state.hist_base)
+        # ---- WRITE RESULTS ONCE ----
+        st.session_state.hist_base = pd.DataFrame(states_base)
 
         if anomaly_on:
-            anom = st.session_state.hist_anom.copy()
-            la = anom.iloc[-1].to_dict()
+            st.session_state.hist_anom = pd.DataFrame(states_anom)
 
-            r_tds_a, r_turb_a = predict_rates(model, FEATURES, la)
-            r_tds_a = np.clip(r_tds_a, -50.0, 50.0)
-            r_turb_a = np.clip(r_turb_a, -30.0, 30.0)
+        st.session_state.running = False
+        st.session_state.finalized = True
+        st.session_state.events.append("Simulation completed")
 
-            if la["time_s"] >= anomaly_time:
-                r_tds_a, r_turb_a = apply_anomaly_to_rates(r_tds_a, r_turb_a, anomaly_type, anomaly_severity)
+        st.rerun()
 
-            na = la.copy()
-            na["time_s"] += DT
-            na["temp_C"] = temp_dynamics(la["temp_C"], h2o2_ml, DT)
-            na["tds"] = max(0.0, float(na["tds"] + ALPHA_INTEGRATION * r_tds_a * DT))
-            na["turbidity"] = turbidity_sensor_update(la["turbidity"], r_turb_a, DT, noise_scale=1.2)
-
-            st.session_state.hist_anom = pd.concat(
-                [st.session_state.hist_anom, pd.DataFrame([na])],
-                ignore_index=True
-            )
-            st.session_state.hist_anom = keep_last_n(st.session_state.hist_anom)
-
-        if nxt["time_s"] >= sim_time:
-            st.session_state.running = False
-            st.session_state.finalized = True
-            st.session_state.events.append("Simulation completed")
-            break
-
-        time.sleep(0.12)
-
-    st.rerun()
 
 # ==================================================
 # REAL-TIME ARDUINO MODE
@@ -897,76 +1027,52 @@ if st.session_state.running and mode == "Online Monitoring (Arduino)":
     batch = int(rt_batch) if "rt_batch" in locals() else RT_READ_BATCH_DEFAULT
 
     new_rows = []
-    for _ in range(batch):
-        if not st.session_state.running:
-            break
+    if st.session_state.running and mode == "Online Monitoring (Arduino)":
 
-        try:
+        ser = st.session_state.ser
+        new_rows = []
+
+        for _ in range(min(rt_batch, 10)):  # HARD LIMIT prevents flicker
             line = ser.readline().decode(errors="ignore").strip()
-        except SerialException as e:
-            # FIX: port got denied mid-run
-            st.session_state.events.append(f"Serial read failed: {e}")
-            safe_close_serial()
-            st.session_state.running = False
-            st.session_state.finalized = True
-            break
-        except Exception:
-            continue
+            if not line:
+                break
 
-        if not line:
-            continue
+            if "Time_s" in line:
+                continue
 
-        # skip header
-        if "Time_s" in line and "Temp" in line:
-            continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5:
+                continue
 
-        # skip garbage lines (common at start)
-        head = line[:10]
-        if any(ch not in "0123456789-., " for ch in head):
-            continue
+            try:
+                row = {
+                    "time_s": float(parts[0]),
+                    "acid_M": float(acid_M),
+                    "h2o2_ml": float(h2o2_ml),
+                    "tds": float(parts[3]),
+                    "turbidity": float(parts[4]),
+                    "temp_C": float(parts[1]),
+                }
+            except Exception:
+                continue
 
-        parts = [p.strip() for p in line.split(",") if p.strip() != ""]
-        if len(parts) < 5:
-            continue
+            tmp_df = pd.concat(
+                [st.session_state.hist_base, pd.DataFrame([row])],
+                ignore_index=True
+            )
 
-        try:
-            t_s = float(parts[0])
-            temp_meas = float(parts[1])
-            tds_raw = float(parts[2])
-            tds_comp = float(parts[3])
-            turb_raw = float(parts[4])
-        except Exception:
-            continue
+            is_rt_anom, rt_score = detect_realtime_anomaly(tmp_df)
+            st.session_state.rt_anom = is_rt_anom
+            st.session_state.rt_anom_score = rt_score
 
-        # skip DS18B20 error reading
-        if temp_meas <= -100:
-            continue
+            new_rows.append(row)
 
-        row = {
-            "time_s": t_s,
-            "acid_M": float(acid_M),
-            "h2o2_ml": float(h2o2_ml),
-            "tds": float(tds_comp),
-            "turbidity": float(turb_raw),
-            "temp_C": float(temp_meas),
-            "tds_raw": float(tds_raw),
-        }
+        if new_rows:
+            st.session_state.hist_base = pd.concat(
+                [st.session_state.hist_base, pd.DataFrame(new_rows)],
+                ignore_index=True
+            )
+            st.session_state.hist_base = keep_last_n(st.session_state.hist_base)
 
-        is_anom, score = predict_anomaly(row)
-        st.session_state.rt_anom = bool(is_anom)
-        st.session_state.rt_anom_score = float(score)
-
-        if is_anom:
-            st.session_state.events.append(f"⚠ anomaly detected (score={score:.2f})")
-
-        new_rows.append(row)
-
-    if len(new_rows) > 0:
-        st.session_state.hist_base = pd.concat(
-            [st.session_state.hist_base, pd.DataFrame(new_rows)],
-            ignore_index=True
-        )
-        st.session_state.hist_base = keep_last_n(st.session_state.hist_base)
-
-    time.sleep(RT_SLEEP)
-    st.rerun()
+        time.sleep(RT_SLEEP)
+        st.rerun()
