@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from graphviz import Digraph
+from io import BytesIO
 from sklearn.metrics import r2_score, mean_squared_error
 
 # =============================
@@ -634,7 +635,113 @@ def try_connect_serial(port, baud):
         safe_close_serial()
         st.session_state.events.append(f"Arduino connect failed: {e}")
         return False
+def create_excel_download():
+    """
+    Export all simulation results to Excel.
+    """
 
+    if len(st.session_state.hist_base) == 0:
+        return
+
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+        # Base simulation
+        st.session_state.hist_base.to_excel(
+            writer,
+            sheet_name="Base_Simulation",
+            index=False
+        )
+
+        # Anomaly simulation
+        if len(st.session_state.hist_anom) > 0:
+            st.session_state.hist_anom.to_excel(
+                writer,
+                sheet_name="Anomaly_Simulation",
+                index=False
+            )
+
+        # KPI summary
+        last = st.session_state.hist_base.iloc[-1]
+
+        summary_rows = [
+            ["Final Time (s)", last["time_s"]],
+            ["Final TDS (ppm)", last["tds"]],
+            ["Final Turbidity", last["turbidity"]],
+            ["Final Temperature (°C)", last["temp_C"]],
+            ["Process Stable", stabilized_flag(st.session_state.hist_base)]
+        ]
+
+        try:
+            k_app = estimate_k_app(st.session_state.hist_base)
+            if k_app is not None:
+                summary_rows.append(
+                    ["Apparent Dissolution Rate Constant", k_app]
+                )
+        except:
+            pass
+
+        try:
+            eta = realtime_eta_to_stable(st.session_state.hist_base)
+            if eta is not None:
+                summary_rows.append(
+                    ["ETA to Stabilization (s)", eta]
+                )
+        except:
+            pass
+
+        summary_df = pd.DataFrame(
+            summary_rows,
+            columns=["Metric", "Value"]
+        )
+
+        summary_df.to_excel(
+            writer,
+            sheet_name="KPI_Summary",
+            index=False
+        )
+
+        # Recovery curve
+        try:
+            rec_df = compute_recovery_index(
+                st.session_state.hist_base
+            )
+
+            if rec_df is not None:
+                rec_df.to_excel(
+                    writer,
+                    sheet_name="Recovery_Index",
+                    index=False
+                )
+        except:
+            pass
+
+        # Dissolution rate
+        try:
+            rate_df = compute_rate(
+                st.session_state.hist_base,
+                "tds"
+            )
+
+            if rate_df is not None:
+                rate_df.to_excel(
+                    writer,
+                    sheet_name="Dissolution_Rate",
+                    index=False
+                )
+        except:
+            pass
+
+    output.seek(0)
+
+    st.download_button(
+        label="📥 Download Excel Results",
+        data=output,
+        file_name="Battery_Leaching_Digital_Twin.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
 # =============================
 # STREAMLIT UI
 # =============================
